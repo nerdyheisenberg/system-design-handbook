@@ -1,0 +1,151 @@
+# Deployment for a stateless HTTP service. See Chapter 17.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: order-api
+  labels:
+    app.kubernetes.io/name: order-api
+    app.kubernetes.io/component: api
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: order-api
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # ⚠️ maxUnavailable: 0 means capacity never drops during a rollout — new
+      # pods must be Ready before old ones go away. The cost is one extra pod's
+      # worth of resources during the roll.
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: order-api
+    spec:
+      # ⚠️ Default is 30s. If your graceful shutdown drains connections for
+      # longer than this, Kubernetes SIGKILLs mid-request.
+      terminationGracePeriodSeconds: 60
+
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+
+      # Spread replicas across nodes and zones so one node or AZ failure does
+      # not take out every replica. ⭐ Three replicas on one node is not three
+      # replicas.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: order-api
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: order-api
+
+      containers:
+        - name: server
+          image: registry.example.com/order-api:1.4.2 # ⚠️ never :latest — it is not a version, and it breaks rollback
+          imagePullPolicy: IfNotPresent
+
+          ports:
+            - name: http
+              containerPort: 8080
+            - name: metrics
+              containerPort: 9090
+
+          # ⭐ requests drive scheduling; limits drive throttling and OOM kills.
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+            limits:
+              # ⚠️ NO CPU LIMIT deliberately. The CFS quota throttles a process
+              # that briefly exceeds its quota even when the node is idle, which
+              # shows up as unexplained p99 latency. Set requests accurately and
+              # let CPU be compressible.
+              #
+              # Memory IS limited, because memory is not compressible — a leak
+              # without a limit takes down the whole node rather than one pod.
+              memory: 512Mi
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: order-api-secrets
+                  key: database-url
+
+          # ⭐ The three probes do different jobs and conflating them causes
+          # outages.
+          #
+          # STARTUP: "has it finished booting?" While this runs, the other two
+          # are suspended. failureThreshold x periodSeconds is the total startup
+          # budget — 30 x 2s = 60s here.
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 2
+            failureThreshold: 30
+
+          # READINESS: "should it receive traffic?" Failing removes the pod from
+          # the Service endpoints. This one may check dependencies, because
+          # temporarily withholding traffic is safe.
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+
+          # LIVENESS: "should it be killed and restarted?"
+          # ⚠️ This must NOT check dependencies. If it pings the database, a
+          # database blip restarts every pod simultaneously — turning a degraded
+          # system into a total outage with an empty cache. Check only that the
+          # process itself is not deadlocked.
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+
+          lifecycle:
+            preStop:
+              exec:
+                # ⭐ Endpoint removal and SIGTERM are concurrent, not ordered.
+                # Without this pause the pod stops accepting connections before
+                # the load balancers have stopped sending them, producing a
+                # burst of 502s on every deploy.
+                command: ["/bin/sleep", "10"]
+
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+
+      # readOnlyRootFilesystem requires an explicit writable /tmp.
+      volumes:
+        - name: tmp
+          emptyDir: {}

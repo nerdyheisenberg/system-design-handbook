@@ -1,0 +1,114 @@
+# StatefulSet for a replicated datastore. See Chapter 17.
+#
+# Use a StatefulSet, not a Deployment, when pods need STABLE IDENTITY:
+#   • predictable names (db-0, db-1, db-2) that survive rescheduling
+#   • stable DNS (db-0.db-headless.default.svc.cluster.local)
+#   • their own persistent volume, reattached to the same ordinal
+#   • ordered, one-at-a-time rollout
+#
+# ⭐ The ordinal is genuinely useful beyond storage: it is a unique, stable small
+# integer per replica, which is exactly what a Snowflake machine ID needs
+# (see code/snowflake_id).
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: db-headless
+spec:
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: db
+  ports:
+    - name: postgres
+      port: 5432
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: db
+spec:
+  serviceName: db-headless # must match the headless Service for stable DNS
+  replicas: 3
+  podManagementPolicy: OrderedReady
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # Roll only the highest ordinals. Useful for canarying a datastore
+      # version change on one replica before committing to the rest.
+      partition: 0
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: db
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: db
+    spec:
+      terminationGracePeriodSeconds: 120 # allow a clean shutdown and checkpoint
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        fsGroup: 999
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          ports:
+            - name: postgres
+              containerPort: 5432
+          env:
+            # Derive the replica's identity from its ordinal.
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: db-secrets
+                  key: password
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          resources:
+            requests:
+              cpu: "2"
+              memory: 8Gi
+            limits:
+              memory: 8Gi
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "postgres"]
+            periodSeconds: 5
+          livenessProbe:
+            exec:
+              command: ["pg_isready", "-U", "postgres"]
+            periodSeconds: 15
+            failureThreshold: 4
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+
+  # ⚠️ volumeClaimTemplates creates one PVC per pod, and Kubernetes does NOT
+  # delete them when the StatefulSet is deleted. That is deliberate — it stops an
+  # accidental `kubectl delete statefulset` from destroying your data — but it
+  # means orphaned volumes accumulate and must be cleaned up deliberately.
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: fast-ssd
+        resources:
+          requests:
+            storage: 100Gi
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: db
+spec:
+  # ⚠️ For a quorum-based system, express the budget in terms of the quorum.
+  # With 3 replicas, losing 2 loses the majority — so at most one may be down.
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: db

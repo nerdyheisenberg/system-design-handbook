@@ -1,0 +1,67 @@
+syntax = "proto3";
+
+package orders.v1;
+
+option go_package = "systemdesign/grpc_example;main";
+
+// Order is the message whose wire encoding is implemented by hand in wire.go.
+// Field numbers are part of the contract: they appear in the encoded bytes, so
+// they may never be reused or changed. Names may be changed freely — they do
+// not appear on the wire at all.
+message Order {
+  int64  id       = 1;  // varint
+  string customer = 2;  // length-delimited
+  int64  amount   = 3;  // varint, minor units (never a float for money)
+  Status status   = 4;  // varint
+  repeated string tags = 5;  // repeated length-delimited
+}
+
+enum Status {
+  // proto3 requires the zero value first, and it is what an absent field
+  // decodes to. Make it a genuine "unset", never a meaningful state.
+  STATUS_UNSPECIFIED = 0;
+  STATUS_PENDING     = 1;
+  STATUS_PAID        = 2;
+  STATUS_CANCELLED   = 3;
+}
+
+message GetOrderRequest {
+  int64 id = 1;
+}
+
+message ListOrdersRequest {
+  string customer = 1;
+  // Cursor pagination, not offset: offset pagination degrades linearly as the
+  // offset grows and skips or repeats rows when the underlying data changes.
+  int32  page_size  = 2;
+  string page_token = 3;
+}
+
+message ListOrdersResponse {
+  repeated Order orders          = 1;
+  string         next_page_token = 2;
+}
+
+message CreateOrderRequest {
+  string customer = 1;
+  int64  amount   = 2;
+  // Supplied by the client and echoed in retries, so a timed-out request that
+  // actually succeeded is not executed twice.
+  string idempotency_key = 3;
+}
+
+service OrderService {
+  // Unary.
+  rpc GetOrder(GetOrderRequest) returns (Order);
+
+  // Unary with pagination.
+  rpc ListOrders(ListOrdersRequest) returns (ListOrdersResponse);
+
+  // Unary write; must be idempotent on idempotency_key.
+  rpc CreateOrder(CreateOrderRequest) returns (Order);
+
+  // Server streaming: the server sends many messages for one request. Use this
+  // instead of returning a huge list, so the client can process incrementally
+  // and neither side buffers the whole result.
+  rpc WatchOrders(ListOrdersRequest) returns (stream Order);
+}

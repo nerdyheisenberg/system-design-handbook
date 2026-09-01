@@ -1,0 +1,135 @@
+# Service, HPA, PodDisruptionBudget and NetworkPolicy. See Chapters 17 and 20.
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: order-api
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: order-api
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+---
+# A headless Service (clusterIP: None) returns pod IPs from DNS instead of a
+# single virtual IP. Use it when the client does its own load balancing — gRPC
+# in particular, because gRPC multiplexes over one long-lived HTTP/2 connection
+# and would otherwise pin every request to whichever pod it first connected to.
+apiVersion: v1
+kind: Service
+metadata:
+  name: order-api-headless
+spec:
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: order-api
+  ports:
+    - name: grpc
+      port: 9000
+      targetPort: 9000
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: order-api
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: order-api
+  minReplicas: 3
+  maxReplicas: 50
+  metrics:
+    # ⚠️ CPU utilisation is a proxy, not the thing you care about. It works when
+    # the service is CPU-bound and misleads badly when it is I/O-bound — a
+    # service waiting on a slow database shows low CPU while queueing.
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+    # ⭐ Scaling on a work-queue metric is usually better: it responds to demand
+    # rather than to a symptom of demand.
+    - type: Pods
+      pods:
+        metric:
+          name: http_requests_in_flight
+        target:
+          type: AverageValue
+          averageValue: "30"
+  behavior:
+    scaleUp:
+      # React quickly to load; the cost of over-provisioning briefly is small.
+      stabilizationWindowSeconds: 30
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 30
+    scaleDown:
+      # ⚠️ Scale down slowly. Aggressive scale-down causes thrashing: you remove
+      # capacity, latency rises, you add it back. Five minutes of stability
+      # before shrinking is a reasonable default.
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Percent
+          value: 25
+          periodSeconds: 60
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: order-api
+spec:
+  # ⭐ Protects against VOLUNTARY disruption — node drains, cluster upgrades,
+  # autoscaler consolidation. Without a PDB a node drain can evict every replica
+  # at once during routine maintenance.
+  # ⚠️ It does not protect against node crashes; nothing does.
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: order-api
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: order-api
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: order-api
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: ingress-gateway
+      ports:
+        - port: 8080
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+      ports:
+        - port: 9090
+  egress:
+    # ⚠️ DNS must be allowed explicitly. The most common NetworkPolicy mistake
+    # is a default-deny egress policy that omits port 53, after which every
+    # hostname lookup fails and the symptoms look like a total network outage.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: postgres
+      ports:
+        - port: 5432

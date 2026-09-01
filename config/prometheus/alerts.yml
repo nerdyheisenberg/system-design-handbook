@@ -1,0 +1,166 @@
+# Alerting rules. See Chapter 19.
+#
+# ⭐ The governing principle: ALERT ON SYMPTOMS, NOT CAUSES.
+#
+# "CPU is at 90%" is a cause. It may be entirely fine. "The error rate users
+# experience exceeds our budget" is a symptom, and it is true regardless of
+# which of the hundred possible causes produced it. Symptom alerts catch
+# failures you did not anticipate; cause alerts only catch the ones you did,
+# and they page you for conditions that are not hurting anyone.
+
+groups:
+  # ---------------------------------------------------------------------------
+  - name: slo-burn-rate
+    rules:
+      # ⭐ MULTI-WINDOW, MULTI-BURN-RATE alerting, from the Google SRE workbook.
+      #
+      # The problem with "error rate > 1% for 5 minutes": it fires on brief
+      # blips that consume a trivial fraction of the budget, and it is slow to
+      # fire on a small-but-sustained leak that will exhaust the budget by
+      # Thursday.
+      #
+      # Burn rate = (observed error rate) / (error budget). For a 99.9% SLO the
+      # budget is 0.1%, so a 1% error rate burns at 10x.
+      #
+      # The short window prevents alerting on a spike that has already resolved.
+
+      # 14.4x over 1 hour exhausts a 30-day budget in ~2 days. Page.
+      - alert: ErrorBudgetBurnFast
+        expr: |
+          (
+            sum(rate(http_requests_total{status=~"5.."}[1h]))
+              / sum(rate(http_requests_total[1h]))
+          ) > (14.4 * 0.001)
+          and
+          (
+            sum(rate(http_requests_total{status=~"5.."}[5m]))
+              / sum(rate(http_requests_total[5m]))
+          ) > (14.4 * 0.001)
+        for: 2m
+        labels:
+          severity: page
+        annotations:
+          summary: "Burning the error budget 14.4x too fast"
+          description: "At this rate the 30-day budget is gone in about 2 days."
+
+      # 6x over 6 hours. Slower, so a ticket rather than a page.
+      - alert: ErrorBudgetBurnSlow
+        expr: |
+          (
+            sum(rate(http_requests_total{status=~"5.."}[6h]))
+              / sum(rate(http_requests_total[6h]))
+          ) > (6 * 0.001)
+          and
+          (
+            sum(rate(http_requests_total{status=~"5.."}[30m]))
+              / sum(rate(http_requests_total[30m]))
+          ) > (6 * 0.001)
+        for: 15m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "Sustained error budget burn"
+
+  # ---------------------------------------------------------------------------
+  - name: symptoms
+    rules:
+      - alert: HighLatency
+        # ⚠️ histogram_quantile over a rate() of _bucket — not a gauge of p99.
+        # Averaging pre-computed percentiles across instances is mathematically
+        # meaningless; you must aggregate the buckets and then compute.
+        expr: |
+          histogram_quantile(0.99,
+            sum by (le, service) (rate(http_request_duration_seconds_bucket[5m]))
+          ) > 0.5
+        for: 10m
+        labels:
+          severity: page
+        annotations:
+          summary: "p99 latency above 500ms on {{ $labels.service }}"
+
+      - alert: ServiceDown
+        expr: up{job="order-api"} == 0
+        for: 2m
+        labels:
+          severity: page
+        annotations:
+          summary: "{{ $labels.instance }} has been unreachable for 2 minutes"
+
+      # ⭐ Alert on DATA AGE, not on job failure. A batch job that "succeeds"
+      # while producing nothing is the failure mode that silently serves stale
+      # results for a week.
+      - alert: StaleAggregates
+        expr: time() - max(aggregate_last_success_timestamp_seconds) > 7200
+        for: 5m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "Aggregates are more than 2 hours old"
+
+  # ---------------------------------------------------------------------------
+  - name: saturation
+    rules:
+      # These are causes, not symptoms — so they are tickets, not pages. They
+      # are worth knowing about because they predict a future symptom.
+
+      - alert: ConnectionPoolNearExhaustion
+        expr: |
+          db_connections_in_use / db_connections_max > 0.9
+        for: 5m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "Connection pool over 90% utilised"
+          description: "Requests will begin queueing for connections."
+
+      - alert: DiskWillFillIn4Hours
+        # ⭐ predict_linear extrapolates the trend, so you are paged before the
+        # disk is full rather than after. A static "85% used" threshold either
+        # fires too early on a stable system or too late on a filling one.
+        expr: |
+          predict_linear(node_filesystem_avail_bytes{fstype!~"tmpfs"}[6h], 4 * 3600) < 0
+        for: 30m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "{{ $labels.instance }}:{{ $labels.mountpoint }} will fill within 4 hours"
+
+      - alert: KafkaConsumerLagGrowing
+        # Absolute lag is not meaningful on its own — 1M messages is fine if you
+        # process 500k/s. The derivative is what matters: lag that is
+        # consistently increasing means the consumer cannot keep up.
+        expr: deriv(kafka_consumergroup_lag[15m]) > 0 and kafka_consumergroup_lag > 100000
+        for: 15m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "Consumer group {{ $labels.consumergroup }} is falling behind"
+
+      - alert: CertificateExpiringSoon
+        expr: (probe_ssl_earliest_cert_expiry - time()) / 86400 < 21
+        for: 1h
+        labels:
+          severity: ticket
+        annotations:
+          summary: "TLS certificate for {{ $labels.instance }} expires in under 21 days"
+
+  # ---------------------------------------------------------------------------
+  - name: meta
+    rules:
+      # ⚠️ Monitor the monitoring. A cardinality explosion degrades Prometheus
+      # itself, and the first symptom is usually that alerts stop firing.
+      - alert: PrometheusCardinalityExplosion
+        expr: prometheus_tsdb_head_series > 5000000
+        for: 30m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "Active series above 5 million — check for a high-cardinality label"
+
+      - alert: PrometheusScrapeFailing
+        expr: up == 0
+        for: 15m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "Prometheus cannot scrape {{ $labels.job }}/{{ $labels.instance }}"
